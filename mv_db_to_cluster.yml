@@ -1,0 +1,185 @@
+---
+- name: Move Icinga2 DB to MariaDB cluster
+  hosts: master.icinga.local
+  become: yes
+  vars:
+    icinga_mv_db_mariadb_cluster: ""
+    icinga_mv_db_mariadb_cluster_user: ""
+    icinga_mv_db_mariadb_cluster_pass: ""
+    icinga_mv_db_name: icinga2
+    icinga_mv_db_service_name_db: mariadb
+    icinga_mv_db_service_name_icinga: icinga2
+    icinga_mv_db_module_name: director
+    icinga_mv_db_resource_name: "Director DB"
+    icinga_mv_db_resource_file: "/etc/icingaweb2/resources.ini"
+    icinga_mv_db_resource_option_dbname_prefix: "icingaweb2_"
+    icinga_mv_db_resource_options_values: ""
+    icinga_mv_db_resource_options_keys:
+      - type
+      - db
+      - host
+      - dbname
+      - username
+      - password
+      - charset
+      - use_ssl
+
+  tasks:
+  - name: "fetch {{ icinga_mv_db_resource_file }}"
+    fetch:
+      src: "{{ icinga_mv_db_resource_file }}"
+      dest: ./
+
+# https://github.com/ansible/ansible/issues/34315 with_ini documented example fails
+
+  - name: "read options for module {{ icinga_mv_db_module_name }} from {{ icinga_mv_db_resource_file }}"
+    set_fact:
+      icinga_mv_db_resource_options_values: "{{ icinga_mv_db_resource_options_values | list }} + [ '{{ item | replace('\"', '')}}' ]"
+    with_ini:
+      - ".* section={{ icinga_mv_db_resource_name }} file={{ inventory_hostname }}{{ icinga_mv_db_resource_file }} re=true"
+
+  - name: "create icinga_mv_db_resource_options list"
+    set_fact:
+      icinga_mv_db_resource_options: "{{ dict(icinga_mv_db_resource_options_keys | zip(icinga_mv_db_resource_options_values)) }}"
+
+  - name: "check if DB is Icinga IDO"
+    set_fact:
+      icinga_mv_db_is_ido: true
+    when: "icinga_mv_db_resource_name is search('_ido')"
+
+  - name: "set prefix to emtpy string - no prefix for IDO"
+    set_fact:
+      icinga_mv_db_resource_option_dbname_prefix: ""
+    when: icinga_mv_db_is_ido
+
+  - name: "check dbname"
+    set_fact:
+      icinga_mv_db_dbname: "{{ [icinga_mv_db_resource_option_dbname_prefix, icinga_mv_db_resource_options['dbname']] | join() if icinga_mv_db_new_dbname is not defined else icinga_mv_db_new_dbname }}"
+
+  - name: "create db user {{ icinga_mv_db_resource_options['username'] }} on cluster {{ icinga_mv_db_mariadb_cluster }}"
+    mysql_user:
+      name: "{{ icinga_mv_db_resource_options['username'] if icinga_mv_db_new_username is not defined else icinga_mv_db_new_username }}"
+      password: "{{ icinga_mv_db_resource_options['password'] if icinga_mv_db_new_password is not defined else icinga_mv_db_new_password }}"
+      host: "%"
+      priv: "{{ icinga_mv_db_dbname }}.*:ALL"
+      login_host: "{{ icinga_mv_db_mariadb_cluster }}"
+      login_user: "{{ icinga_mv_db_mariadb_cluster_user }}"
+      login_password: "{{ icinga_mv_db_mariadb_cluster_pass }}"
+      state: present
+
+  - name: "disable icingaweb2 module {{ icinga_mv_db_module_name }}"
+    command: "icingacli module disable {{ icinga_mv_db_module_name | quote }}"
+    when: "icinga_mv_db_module_name | length > 0"
+
+  - name: "disable icinga service"
+    service:
+      name: icinga2
+      state: stopped
+    when: icinga_mv_db_is_ido
+
+  - name: "mysqldump {{ icinga_mv_db_resource_options['dbname'] }}"
+    mysql_db:
+      name: "{{ icinga_mv_db_resource_options['dbname'] }}"
+      state: dump
+      target: "/tmp/{{ icinga_mv_db_resource_options['dbname'] }}.sql"
+      login_host: localhost
+
+  - name: "import {{ icinga_mv_db_resource_options['dbname'] }} into {{ icinga_mv_db_dbname }} on {{ icinga_mv_db_mariadb_cluster }}"
+    mysql_db:
+      name: "{{ icinga_mv_db_dbname }}"
+      state: import
+      target: "/tmp/{{ icinga_mv_db_resource_options['dbname'] }}.sql"
+      login_host: "{{ icinga_mv_db_mariadb_cluster }}"
+      login_user: "{{ icinga_mv_db_mariadb_cluster_user }}"
+      login_password: "{{ icinga_mv_db_mariadb_cluster_pass }}"
+
+  - name: "update host in {{ icinga_mv_db_resource_file }}"
+    ini_file:
+      path: "{{ icinga_mv_db_resource_file }}"
+      section: "{{ icinga_mv_db_resource_name }}"
+      option: "host"
+      value: "\"{{ icinga_mv_db_mariadb_cluster }}\""
+      backup: yes
+
+  - name: "update dbname in {{ icinga_mv_db_resource_name }}"
+    ini_file:
+      path: "{{ icinga_mv_db_resource_file }}"
+      section: "{{ icinga_mv_db_resource_name }}"
+      option: "dbname"
+      value: "\"{{ icinga_mv_db_dbname }}\""
+      backup: yes
+
+  - name: "update user in {{ icinga_mv_db_resource_file }}"
+    ini_file:
+      path: "{{ icinga_mv_db_resource_file }}"
+      section: "{{ icinga_mv_db_resource_name }}"
+      option: "username"
+      value: "\"{{ icinga_mv_db_resource_options['username'] if icinga_mv_db_new_username is not defined else icinga_mv_db_new_username }}\""
+      backup: yes
+
+  - name: "update password in {{ icinga_mv_db_resource_file }}"
+    ini_file:
+      path: "{{ icinga_mv_db_resource_file }}"
+      section: "{{ icinga_mv_db_resource_name }}"
+      option: "password"
+      value: "\"{{ icinga_mv_db_resource_options['password'] if icinga_mv_db_new_password is not defined else icinga_mv_db_new_password }}\""
+      backup: yes
+
+  - name: "update charset in {{ icinga_mv_db_resource_name }}"
+    ini_file:
+      path: "{{ icinga_mv_db_resource_file }}"
+      section: "{{ icinga_mv_db_resource_name }}"
+      option: "charset"
+      value: "\"{{ icinga_mv_db_resource_options['charset'] }}\""
+      backup: yes
+
+  - name: "update use_ssl in {{ icinga_mv_db_resource_name }}"
+    ini_file:
+      path: "{{ icinga_mv_db_resource_file }}"
+      section: "{{ icinga_mv_db_resource_name }}"
+      option: "use_ssl"
+      value: "\"{{ icinga_mv_db_resource_options['use_ssl'] }}\""
+      backup: yes
+    when: "icinga_mv_db_resource_options['use_ssl'] is defined"
+
+  - name: "update user in ido-mysql.conf"
+    lineinfile:
+      path: "/etc/icinga2/features-enabled/ido-mysql.conf"
+      regexp: "user ="
+      line: "  user = \"{{ icinga_mv_db_resource_options['username'] if icinga_mv_db_new_username is not defined else icinga_mv_db_new_username }}\","
+      backup: yes
+    when: icinga_mv_db_is_ido
+
+  - name: "update password in ido-mysql.conf"
+    lineinfile:
+      path: "/etc/icinga2/features-enabled/ido-mysql.conf"
+      regexp: "password ="
+      line: "  password = \"{{ icinga_mv_db_resource_options['password'] if icinga_mv_db_new_password is not defined else icinga_mv_db_new_password }}\","
+      backup: yes
+    when: icinga_mv_db_is_ido
+
+  - name: "update host in ido-mysql.conf"
+    lineinfile:
+      path: "/etc/icinga2/features-enabled/ido-mysql.conf"
+      regexp: "host ="
+      line: "  host = \"{{ icinga_mv_db_mariadb_cluster }}\","
+      backup: yes
+    when: icinga_mv_db_is_ido
+
+  - name: "update database in ido-mysql.conf"
+    lineinfile:
+      path: "/etc/icinga2/features-enabled/ido-mysql.conf"
+      regexp: "database ="
+      line: "  database = \"{{ icinga_mv_db_dbname }}\""
+      backup: yes
+    when: icinga_mv_db_is_ido
+
+  - name: "enable icingaweb2 module {{ icinga_mv_db_module_name }}"
+    command: "icingacli module enable {{ icinga_mv_db_module_name | quote }}"
+    when: "icinga_mv_db_module_name | length > 0"
+
+  - name: "enable icinga service"
+    service:
+      name: icinga2
+      state: started
+    when: icinga_mv_db_is_ido
